@@ -1,9 +1,19 @@
 # Frameo 15.6-inch 159K (RK3326, Android 8.1)
 
-Status: **tested on one unit, using macOS.** The boot-ramdisk TCP ADB patch
-has been written, read back and booted to the Frameo home screen. The
-owner confirmed working network ADB and root through the shipped `su`.
-Other firmware variants have not been tested.
+Status: **historical success reports from two units.** The original macOS
+owner confirmed that a boot-ramdisk TCP ADB patch booted to the Frameo home
+screen, with network ADB and root through the shipped `su`. A second owner,
+[ozzyonfire, using ArchLinux](https://github.com/wesbos/photo-frame-dashboard/pull/213#issuecomment-6457452772),
+reported success after changing `/adb_keys` from root:root 0600 to
+root:root 0644 and using separate ramdisk/header writes. The 0600 key
+left ADB `unauthorized` on that unit. **The revised builder and guarded
+recipe below have not been hardware-tested.** Other firmware variants
+remain untested.
+
+**This patch enables TCP ADB on port 5555 on all network interfaces after
+every boot, with root available through the shipped `su`. Rejection of unknown host keys
+has not been verified; do not treat preserved authentication properties
+as proof of enforcement. Keep the frame on an isolated, trusted network.**
 
 ## Identity
 
@@ -41,6 +51,11 @@ not ship boot images, keys, or dumps.
 
 ### Reader used on the tested unit
 
+The [FRAME157 reader notes](pastigio-frame157.md#reader-needed-for-the-full-backup)
+explain the same 32 MiB limit and helper patch. That frame used DDR
+**v2.06**; the 159K used **v2.07** below. Do not substitute FRAME157's DDR
+binary or firmware layout.
+
 The original DDR and USB-helper binaries match Rockchip's official rkbin commit
 [`3968b8eb04e365e64480a6b24f776273c6708e95`](https://github.com/rockchip-linux/rkbin/tree/3968b8eb04e365e64480a6b24f776273c6708e95),
 under `bin/rk33/`. The table also identifies the locally patched helper:
@@ -56,6 +71,27 @@ The patched helper differs only at file offset `0x908c`: `ee031032`
 shared read limit. These bytes apply only to the exact helper above.
 `scripts/load-usb-reader.py` targets RK3568 and is not the uploader for
 this frame.
+
+After the device-identity checks and owner approval described under
+**Flash and rollback**, verify all three reader files against the hashes
+above. Enter fresh BootROM and upload the tested pairing:
+
+```sh
+rkdeveloptool rd 3
+xrock maskrom \
+  diagnostics/frameo-159k/reader/rk3326_ddr_333MHz_v2.07.bin \
+  diagnostics/frameo-159k/reader/rk3326_usbplug_v1.36-read-unlimited.bin
+```
+
+Place the matching official DDR and original helper, plus the locally
+patched helper, in that reader directory. Keep xrock's default **RC4
+enabled** for this upload; do not pass `--rc4-off`. This command uploads
+the DDR v2.07/patched usbplug v1.36 pair; it does not use the RK3568 uploader.
+The second owner
+[reported xrock `50effce`](https://github.com/wesbos/photo-frame-dashboard/pull/213#issuecomment-6457452772);
+the locally reviewed source checkout is
+[`50effcef229a7e8ff85fde916e635cdd58fe8c09`](https://github.com/xboot/xrock/tree/50effcef229a7e8ff85fde916e635cdd58fe8c09).
+This does not independently pin the original macOS execution.
 
 The reader was loaded into RAM, not installed to flash. A responding
 flash-info query alone does not establish unrestricted reads: verify
@@ -88,8 +124,8 @@ RSCE SHA-256:
 The builder adds only:
 
 1. `/adb_keys` containing the supplied host ADB public key, with its
-   comment removed. The file is uid/gid 0, mode 0600. No private key is
-   included.
+   comment removed. The file is uid/gid 0, mode 0644 so the shell-uid
+   `adbd` can read it. No private key is included.
 2. Two commands in the existing `on property:sys.boot_completed=1` block
    of `init.root.rc`:
 
@@ -107,6 +143,11 @@ The patch does **not** change:
   the boot header ID, or the partition tail;
 - `system`, `vendor`, `uboot`, `trust`, or `resource`.
 
+The ramdisk's `default.prop` is a symlink to `system/etc/prop.default`.
+The builder preserves that symlink and checks the matching extracted
+system property file before accepting the build; it does not replace the
+symlink with a regular file or edit the system partition.
+
 No `su` binary is added. The owner confirmed root through the frame's
 shipped `su`. The firmware includes SuperSU `/system/xbin/su` and a
 vendor `rootservice`/`daemonsu` boot path; the patch leaves these intact.
@@ -120,114 +161,220 @@ therefore leaves USB alone and uses network ADB.
 
 ## Build
 
-The builder is offline-only and refuses if the source does not match the
-verified stock image or layout.
+The builder is offline-only and refuses a source boot image, layout or
+system property file that does not match the pinned firmware. Extract
+`/etc/prop.default` from the matching, verified **raw ext4 system partition
+backup**. This path is inside that partition, which Android mounts at
+`/system`; it is not a path inside the boot ramdisk. For example, with
+`debugfs` from e2fsprogs (no `-w`, so the backup is opened read-only):
+
+```sh
+debugfs -R 'dump /etc/prop.default diagnostics/frameo-159k/system-prop.default' \
+  diagnostics/frameo-159k/system.img
+```
+
+Use your own verified system partition backup at `system.img`; do not
+substitute another frame's properties or fabricate this input from the
+values below. The extracted file must be exactly **391 bytes**, SHA-256
+`7f7514955dab69a06621b85eec79c39a22af7312b1d87c9e7558dd0a57d13692`.
+The builder checks the complete file and requires exactly one
+`ro.adb.secure=1` assignment before creating output.
 
 ```sh
 python3 scripts/build-frameo159k-boot.py \
   --source diagnostics/frameo-159k/boot-stock-read1.img \
+  --system-default-prop diagnostics/frameo-159k/system-prop.default \
   --public-key ~/.android/adbkey.pub \
-  --output-dir diagnostics/frameo-159k/boot-patched
-
-python3 - <<'PY'
-import hashlib
-import json
-from pathlib import Path
-
-output = Path("diagnostics/frameo-159k/boot-patched")
-manifest = json.loads((output / "manifest.json").read_text())
-candidate = (output / "boot.img").read_bytes()
-if (len(candidate) != 64 * 1024 * 1024
-        or hashlib.sha256(candidate).hexdigest() != manifest["candidate_boot_sha256"]):
-    raise SystemExit("STOP: candidate size or manifest hash mismatch")
-print("Candidate matches its manifest:", manifest["candidate_boot_sha256"])
-PY
+  --output-dir diagnostics/frameo-159k/boot-patched-review
 ```
 
-The manifest records the source,
-candidate, ramdisk slot, key hash and preserved components. Its
+Use a new output directory. Format 2 of `manifest.json` records the
+source and candidate images, property-file evidence, public-key hash,
+preserved components and four sector-aligned payload files:
+
+| Payload | File | Device LBA | Sectors | Bytes |
+| --- | --- | --- | --- | --- |
+| Original header | `orig-header.bin` | `0x22000` | 1 | 512 |
+| Candidate header | `new-header.bin` | `0x22000` | 1 | 512 |
+| Original ramdisk slot | `orig-ramdisk.bin` | `0x2B7A8` | 2,884 | 1,476,608 |
+| Candidate ramdisk slot | `new-ramdisk.bin` | `0x2B7A8` | 2,884 | 1,476,608 |
+
+`boot.img` remains the complete 64 MiB candidate for offline comparison
+and full readback verification. It is not the write payload. Retain the
+stock image and this exact output directory for undo. The manifest's
 `NOT_FLASHED_NOT_BOOTED` status describes the newly built candidate;
 building an image does not establish that it will boot on a device.
 
 ## Flash and rollback
 
-The boot-only commands below use the tested unit's layout. The builder
-itself neither flashes nor checks a connected device. Before **either**
-write, obtain the owner's approval for that specific write and complete
-these checks:
+The recipe below is specific to this firmware and writes only the two
+ranges above. The builder neither accesses a device nor authorizes a
+write. Obtain the owner's approval for the selected operation and finish
+these checks before running the recipe:
 
-1. Have a verified backup and the verified 64 MiB stock boot image ready.
+1. Have a verified backup and the pinned 64 MiB stock boot image ready.
 2. With only the intended frame connected, run `rkdeveloptool ld`,
    `rkdeveloptool rci`, `rkdeveloptool rfi` and `rkdeveloptool ppt`.
    Confirm exactly one Rockchip device (`2207:330d`), RK3326, SAMSUNG
    flash with 122,142,720 sectors, and a `boot` partition starting at
    `0x22000` with 131,072 sectors. Stop if any identity or layout differs.
-3. Confirm the exact reader setup above is loaded and unrestricted reads
-   have been verified. Re-entering Loader/MaskROM after a reset requires
-   re-establishing that RAM reader before relying on full readbacks.
-4. Read the current boot partition before writing:
+3. Load the exact reader setup above and verify unrestricted reads,
+   including beyond 32 MiB. After leaving that RAM reader session, it
+   must be re-established before relying on full readbacks.
+4. Select `install` to go from the pinned stock image to this candidate,
+   or `undo` to restore stock from this exact installed candidate. Keep
+   the matching manifest; a different candidate or any unknown current
+   image is refused. Investigate a failed or partial write with the
+   owner before deciding on recovery.
 
-   ```sh
-   rkdeveloptool rl 0x22000 131072 diagnostics/frameo-159k/boot-current.img
-   wc -c diagnostics/frameo-159k/boot-current.img
-   shasum -a 256 diagnostics/frameo-159k/boot-current.img
-   ```
-
-   Require exactly 67,108,864 bytes. Before an initial patch, the hash
-   must equal the pinned stock hash above. Before replacing or rolling
-   back a known patched image, it must equal that installed image's
-   saved manifest hash. Stop on an unknown hash; keep the read for
-   investigation rather than overwriting an unknown device state.
-5. Verify the image to be written immediately before the write: the
-   candidate must pass the manifest check in **Build**, or the stock
-   rollback file must be exactly 67,108,864 bytes with the pinned stock
-   hash. Keep the saved manifest for the candidate actually installed.
-
-After those checks, the candidate write and full readback are:
+This common recipe validates **all offline artifacts before any device
+command**, then reads and checks the current full boot image. It writes
+the ramdisk slot first and requires an exact size/hash readback before
+writing the header. It verifies the header readback and finally the
+entire boot partition. The same sequence applies to undo. Any exception,
+command failure or mismatch stops execution. The recipe never resets the
+frame; a failure leaves it in the reader session for investigation.
 
 ```sh
-rkdeveloptool wl 0x22000 diagnostics/frameo-159k/boot-patched/boot.img
-rkdeveloptool rl 0x22000 131072 diagnostics/frameo-159k/boot-patched/boot-readback.img
-python3 - <<'PY'
+operation=install  # Change to undo only for this candidate's approved rollback.
+python3 - "$operation" <<'PY'
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 
-output = Path("diagnostics/frameo-159k/boot-patched")
-manifest = json.loads((output / "manifest.json").read_text())
-for name in ("boot.img", "boot-readback.img"):
-    data = (output / name).read_bytes()
-    if (len(data) != 64 * 1024 * 1024
-            or hashlib.sha256(data).hexdigest() != manifest["candidate_boot_sha256"]):
-        raise SystemExit(f"STOP: {name} size or manifest hash mismatch; do not reset")
-print("Candidate and full readback match the candidate manifest")
+output = Path("diagnostics/frameo-159k/boot-patched-review")
+stock_path = Path("diagnostics/frameo-159k/boot-stock-read1.img")
+STOCK_SHA256 = "8ab5a0be2740c86ee6af013a9675eb6a571e0dff0967574a4657d5415b8b717e"
+BOOT_LBA = 0x22000
+BOOT_SECTORS = 131072
+BOOT_BYTES = 67108864
+EXPECTED = {
+    "orig_header": ("orig-header.bin", 0x22000, 1, 512),
+    "new_header": ("new-header.bin", 0x22000, 1, 512),
+    "orig_ramdisk": ("orig-ramdisk.bin", 0x2B7A8, 2884, 1476608),
+    "new_ramdisk": ("new-ramdisk.bin", 0x2B7A8, 2884, 1476608),
+}
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def checked(data, size, digest, label):
+    require(len(data) == size, f"{label}: wrong byte count")
+    require(sha256(data) == digest, f"{label}: SHA-256 mismatch")
+    return data
+
+
+def main():
+    require(len(sys.argv) == 2 and sys.argv[1] in ("install", "undo"),
+            "operation must be install or undo")
+    operation = sys.argv[1]
+    manifest = json.loads((output / "manifest.json").read_text())
+    require(type(manifest["format"]) is int and manifest["format"] == 2,
+            "manifest format must be 2")
+    for field in ("source_boot_bytes", "candidate_boot_bytes"):
+        require(type(manifest[field]) is int and manifest[field] == BOOT_BYTES,
+                f"{field}: wrong size")
+    require(manifest["source_boot_sha256"] == STOCK_SHA256,
+            "manifest source hash is not pinned stock")
+    stock = checked(stock_path.read_bytes(), BOOT_BYTES, STOCK_SHA256, "stock")
+    candidate_hash = manifest["candidate_boot_sha256"]
+    candidate = checked((output / "boot.img").read_bytes(), BOOT_BYTES,
+                        candidate_hash, "candidate")
+    require(candidate_hash != STOCK_SHA256, "candidate equals stock")
+    payloads = manifest["payloads"]
+    require(isinstance(payloads, dict) and set(payloads) == set(EXPECTED),
+            "manifest must contain exactly the four expected payloads")
+    data = {}
+    for name, (filename, lba, sectors, size) in EXPECTED.items():
+        item = payloads[name]
+        require(item["file"] == filename, f"{name}: wrong filename")
+        for field, expected in (("lba", lba), ("sectors", sectors), ("bytes", size)):
+            require(type(item[field]) is int and item[field] == expected,
+                    f"{name}: wrong {field}")
+        data[name] = checked((output / filename).read_bytes(), size,
+                             item["sha256"], name)
+        offset = (lba - BOOT_LBA) * 512
+        image = stock if name.startswith("orig_") else candidate
+        require(data[name] == image[offset:offset + size],
+                f"{name}: does not match full-image slice")
+    for source, target, prefix in ((stock, candidate, "new"),
+                                    (candidate, stock, "orig")):
+        rebuilt = bytearray(source)
+        for part in ("ramdisk", "header"):
+            name = f"{prefix}_{part}"
+            _, lba, _, size = EXPECTED[name]
+            offset = (lba - BOOT_LBA) * 512
+            rebuilt[offset:offset + size] = data[name]
+        require(rebuilt == target, f"{prefix}: reconstruction differs outside payloads")
+
+    # Stage validated bytes so later changes to the original files cannot change a write.
+    with tempfile.TemporaryDirectory(prefix="159k-verified-", dir=output) as directory:
+        work = Path(directory)
+        for name, payload in data.items():
+            staged = work / EXPECTED[name][0]
+            staged.write_bytes(payload)
+            checked(staged.read_bytes(), len(payload), sha256(payload), name + " staged")
+
+        def read_checked(lba, sectors, filename, digest):
+            path = work / filename  # Each read uses a fresh path, never a stale readback.
+            require(not path.exists(), f"readback path already exists: {path}")
+            subprocess.run(["rkdeveloptool", "rl", hex(lba), str(sectors), str(path)],
+                           check=True)
+            checked(path.read_bytes(), sectors * 512, digest, filename)
+
+        before_hash = STOCK_SHA256 if operation == "install" else candidate_hash
+        after_hash = candidate_hash if operation == "install" else STOCK_SHA256
+        prefix = "new" if operation == "install" else "orig"
+        read_checked(BOOT_LBA, BOOT_SECTORS, "boot-current.img", before_hash)
+        for part in ("ramdisk", "header"):
+            name = f"{prefix}_{part}"
+            filename, lba, sectors, size = EXPECTED[name]
+            staged = work / filename
+            checked(staged.read_bytes(), size, sha256(data[name]), name + " before write")
+            subprocess.run(["rkdeveloptool", "wl", hex(lba), str(staged)], check=True)
+            read_checked(lba, sectors, part + "-readback.bin", sha256(data[name]))
+            # The header iteration is unreachable unless ramdisk readback succeeds.
+        read_checked(BOOT_LBA, BOOT_SECTORS, "boot-full-readback.img", after_hash)
+        print(f"Verified {operation}: full boot SHA-256 {after_hash}; no reset performed")
+
+
+try:
+    main()
+except Exception as error:
+    raise SystemExit(f"STOP: {error}; do not reset or retry a write without investigation")
 PY
 ```
 
-Do not reset until the readback matches. If verification fails, keep the
-device in the reader session and investigate before another write.
-Rollback uses the verified stock boot image, after repeating the checks
-above. If a failed write left an unknown current hash, stop and review
-recovery with the owner before approving a stock restoration.
-
-```sh
-rkdeveloptool wl 0x22000 diagnostics/frameo-159k/boot-stock-read1.img
-rkdeveloptool rl 0x22000 131072 diagnostics/frameo-159k/boot-patched/boot-stock-readback.img
-cmp diagnostics/frameo-159k/boot-stock-read1.img diagnostics/frameo-159k/boot-patched/boot-stock-readback.img
-shasum -a 256 \
-  diagnostics/frameo-159k/boot-stock-read1.img \
-  diagnostics/frameo-159k/boot-patched/boot-stock-readback.img
-```
-
-Require `cmp` to succeed and both hashes to match before resetting.
+Only a successful final full-image check establishes that this operation's
+bytes reached flash. It does not establish that the revised candidate
+boots. Do not reset or attempt another write after any failure.
 
 ## Test plan and status
 
-- [x] Build the candidate and verify the source/candidate hashes.
-- [x] Write the boot partition and read back all 131,072 sectors.
-- [x] Boot the frame to the Frameo home screen.
-- [x] Connect over network ADB.
-- [x] Obtain root through the shipped `su`.
+The original macOS report confirmed a written/read-back boot image,
+Frameo home-screen boot, network ADB and shipped-`su` root. Those are
+historical results for that owner's candidate. The second ArchLinux
+[report by ozzyonfire](https://github.com/wesbos/photo-frame-dashboard/pull/213#issuecomment-6457452772)
+confirms that root:root 0644 resolved `unauthorized`, with separate
+ramdisk/header writes. These owner reports motivate the revised builder;
+neither is a hardware test of its current output or this guarded recipe.
+
+For a newly built candidate, these checks are still pending on hardware:
+
+- [ ] Verify both write ranges and the full boot image with the recipe above.
+- [ ] Boot to the Frameo home screen and connect over network ADB.
+- [ ] Confirm shell uid and root through the shipped `su`.
+- [ ] Test that a fresh, unauthorized host key is rejected.
 
 The following are verification examples, not a transcript of the owner's
 results. Use the `su` syntax supported by the shipped binary:
@@ -251,9 +398,14 @@ returns uid 0. The vendor boot path is expected to report
 and root; exact shell, daemon and property outputs are not recorded here.
 
 A no-internet Wi-Fi AP is sufficient; the frame does not need internet
-access for ADB. Keep the frame on a trusted network.
+access for ADB. Keep the frame on an isolated, trusted network.
 
 ## Security
+
+**TCP 5555 listens on all network interfaces after every boot, and an
+admitted ADB client can reach the shipped `su`. Unknown-key rejection is untested. Isolate
+this frame from untrusted clients even though `ro.secure=1` and
+`ro.adb.secure=1` are preserved.**
 
 - The patch adds the supplied public key and preserves the firmware's
   ADB authentication properties. It does not clear authorizations in
